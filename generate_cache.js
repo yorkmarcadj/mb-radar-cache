@@ -1,98 +1,121 @@
 // generate_cache.js
-// Node 20+
+// Node 20+ (ESM)
 // Genera cache.json consumiendo las URLs listadas en sources.json
 
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const SOURCES_PATH = path.join(process.cwd(), "sources.json");
+const OUT_PATH = path.join(process.cwd(), "cache.json");
+
 // --- iTunes enrich (no auth) ---
 // Persists small cache in repo to avoid re-querying.
 const ITUNES_CACHE_PATH = path.join(__dirname, "itunes_cache.json");
-function loadItunesCache(){
-  try { return JSON.parse(fs.readFileSync(ITUNES_CACHE_PATH,"utf8")); } catch { return {}; }
+
+function loadItunesCache() {
+  try {
+    return JSON.parse(fs.readFileSync(ITUNES_CACHE_PATH, "utf8"));
+  } catch {
+    return {};
+  }
 }
-function saveItunesCache(cache){
+function saveItunesCache(cache) {
   fs.writeFileSync(ITUNES_CACHE_PATH, JSON.stringify(cache, null, 2), "utf8");
 }
-function normKey(s){ return String(s||"").toLowerCase().replace(/\s+/g," ").trim(); }
-function trackKey(artist, title){ return `${normKey(artist)} — ${normKey(title)}`; }
 
-async function itunesLookup(artist, title){
+// ✅ normalizador simple SOLO para iTunes cache
+function normText(s) {
+  return String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+function trackKey(artist, title) {
+  return `${normText(artist)} — ${normText(title)}`;
+}
+
+async function itunesLookup(artist, title) {
   const term = encodeURIComponent(`${artist} ${title}`.trim());
   const url = `https://itunes.apple.com/search?term=${term}&entity=song&limit=1`;
-  const res = await fetch(url, { headers: { "User-Agent": "MB-RadarCache/1.0" }});
-  if(!res.ok) throw new Error(`itunes_http_${res.status}`);
+  const res = await fetch(url, { headers: { "User-Agent": "MB-RadarCache/1.0" } });
+  if (!res.ok) throw new Error(`itunes_http_${res.status}`);
   const json = await res.json();
-  const item = (json.results && json.results[0]) ? json.results[0] : null;
-  if(!item) return null;
+  const item = json.results && json.results[0] ? json.results[0] : null;
+  if (!item) return null;
   return {
     itunes_genre: item.primaryGenreName || "",
-    release_date: item.releaseDate ? String(item.releaseDate).slice(0,10) : "",
+    release_date: item.releaseDate ? String(item.releaseDate).slice(0, 10) : "",
     track_view_url: item.trackViewUrl || "",
-    artwork: (item.artworkUrl100 || item.artworkUrl60 || item.artworkUrl30 || "").replace("100x100", "300x300")
+    artwork: (item.artworkUrl100 || item.artworkUrl60 || item.artworkUrl30 || "").replace("100x100", "300x300"),
   };
 }
 
-function calcAgeDays(releaseDateISO){
-  if(!releaseDateISO) return null;
+function calcAgeDays(releaseDateISO) {
+  if (!releaseDateISO) return null;
   const d = new Date(releaseDateISO);
-  if(isNaN(d.getTime())) return null;
+  if (isNaN(d.getTime())) return null;
   const now = new Date();
   const diff = now.getTime() - d.getTime();
-  return Math.max(0, Math.floor(diff / (1000*60*60*24)));
+  return Math.max(0, Math.floor(diff / (1000 * 60 * 60 * 24)));
 }
 
-async function enrichWithItunes(items, errors){
+async function enrichWithItunes(items, errors) {
   const cache = loadItunesCache();
   let used = 0;
 
-  // Enrich unique tracks only once (items are already de-duped).
-  // Concurrency limiter:
   const CONCURRENCY = 6;
   let i = 0;
 
-  async function worker(){
-    while(i < items.length){
+  async function worker() {
+    while (i < items.length) {
       const idx = i++;
       const it = items[idx];
       const key = trackKey(it.artist, it.title);
-      if(cache[key]){
+
+      if (cache[key]) {
         const c = cache[key];
         it.itunes_genre = it.itunes_genre || c.itunes_genre || "";
         it.release_date = it.release_date || c.release_date || "";
         it.itunes_artwork = it.itunes_artwork || c.artwork || "";
-        it.release_year = it.release_year || (it.release_date ? Number(String(it.release_date).slice(0,4)) : null);
+        it.release_year = it.release_year || (it.release_date ? Number(String(it.release_date).slice(0, 4)) : null);
         it.age_days = it.age_days ?? calcAgeDays(it.release_date);
+        it.track_view_url = it.track_view_url || c.track_view_url || "";
         continue;
       }
-      try{
+
+      try {
         const found = await itunesLookup(it.artist, it.title);
-        if(found){
+        if (found) {
           cache[key] = found;
           used++;
+
           it.itunes_genre = it.itunes_genre || found.itunes_genre || "";
           it.release_date = it.release_date || found.release_date || "";
           it.itunes_artwork = it.itunes_artwork || found.artwork || "";
-          it.release_year = it.release_year || (it.release_date ? Number(String(it.release_date).slice(0,4)) : null);
+          it.track_view_url = it.track_view_url || found.track_view_url || "";
+          it.release_year = it.release_year || (it.release_date ? Number(String(it.release_date).slice(0, 4)) : null);
           it.age_days = it.age_days ?? calcAgeDays(it.release_date);
         } else {
-          cache[key] = { itunes_genre:"", release_date:"", track_view_url:"", artwork:"" };
+          cache[key] = { itunes_genre: "", release_date: "", track_view_url: "", artwork: "" };
         }
-      }catch(e){
-        errors.push({ source: "iTunes", error: "itunes_lookup_failed", detail: String(e.message||e), track: `${it.artist} - ${it.title}` });
+      } catch (e) {
+        errors.push({
+          source: "iTunes",
+          error: "itunes_lookup_failed",
+          detail: String(e.message || e),
+          track: `${it.artist} - ${it.title}`,
+        });
       }
     }
   }
 
-  const workers = Array.from({length: CONCURRENCY}, ()=>worker());
+  const workers = Array.from({ length: CONCURRENCY }, () => worker());
   await Promise.all(workers);
+
   saveItunesCache(cache);
   return used;
 }
-
-
-const OUT_PATH = path.join(process.cwd(), "cache.json");
 
 function nowISO() {
   return new Date().toISOString();
@@ -116,7 +139,7 @@ function splitArtistTitle(track) {
   const seps = [" - ", " — ", " – ", " : "];
   for (const sep of seps) {
     if (track.includes(sep)) {
-      const [a, t] = track.split(sep, 2).map(x => x.trim());
+      const [a, t] = track.split(sep, 2).map((x) => x.trim());
       if (a && t) return [a, t];
     }
   }
@@ -125,8 +148,10 @@ function splitArtistTitle(track) {
   return ["", track];
 }
 
-function normKey(artist, title) {
-  const s = (artist + " - " + title).toLowerCase()
+// ✅ ESTA es la key global para dedup (nombre distinto, ya no choca)
+function normKeyTrack(artist, title) {
+  const s = (artist + " - " + title)
+    .toLowerCase()
     .replace(/[^a-z0-9\u00c0-\u017f\s\-]/gu, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -168,24 +193,24 @@ function parseKworbTracks(html, sourceType, sourceName, sourceUrl, region, bucke
     if (items.length >= max) break;
     const row = rm[1];
 
-    // pos
     const mNum = row.match(/class="num"[^>]*>\s*([0-9]{1,3})\s*</i);
     if (mNum) pos = parseInt(mNum[1], 10);
     else {
       const mAny = row.match(/>\s*([0-9]{1,3})\s*</);
-      pos = mAny ? parseInt(mAny[1], 10) : (pos + 1);
+      pos = mAny ? parseInt(mAny[1], 10) : pos + 1;
     }
 
-    // track text: link-first
     let track = "";
     const aMatches = [...row.matchAll(/<a[^>]*>([\s\S]*?)<\/a>/gi)];
     for (const am of aMatches) {
       const t = cleanTrackText(am[1]);
       if (!t) continue;
-      if (/[-–—:]/u.test(t) && t.length >= 6) { track = t; break; }
+      if (/[-–—:]/u.test(t) && t.length >= 6) {
+        track = t;
+        break;
+      }
     }
 
-    // fallback: td más largo
     if (!track) {
       const tdMatches = [...row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)];
       let best = "";
@@ -223,6 +248,8 @@ function parseKworbTracks(html, sourceType, sourceName, sourceUrl, region, bucke
       youtube_video_id: "",
       youtube_url: "",
       cover_url: "",
+      itunes_artwork: "",
+      track_view_url: "",
       published: nowISO(),
     });
   }
@@ -236,7 +263,7 @@ function aggregateAndDedup(items) {
   for (const it of items) {
     const artist = it.artist || "";
     const title = it.title || it.track_raw || "";
-    const k = normKey(artist, title);
+    const k = normKeyTrack(artist, title);
     if (!k || k === "-") continue;
 
     if (!map.has(k)) {
@@ -263,7 +290,7 @@ function aggregateAndDedup(items) {
 
   const out = [...map.values()];
   for (const it of out) {
-    const ps = it.sources_positions.map(x => x.pos).filter(Boolean);
+    const ps = it.sources_positions.map((x) => x.pos).filter(Boolean);
     if (ps.length) it.avg_pos = Math.round(ps.reduce((a, b) => a + b, 0) / ps.length);
     const bp = it.best_pos ?? 999;
     it.score = Math.max(1, 200 - bp);
@@ -288,18 +315,14 @@ async function main() {
     try {
       const html = await fetchText(url);
       const items = parseKworbTracks(html, st, name, url, region, bucket, 200);
-      if (!items.length) {
-        errors.push({ source: name, error: "parse_empty" });
-      } else {
-        all.push(...items);
-      }
+      if (!items.length) errors.push({ source: name, error: "parse_empty" });
+      else all.push(...items);
     } catch (e) {
       errors.push({ source: name, error: "fetch_failed", detail: String(e.message || e) });
     }
   }
 
   const unique = aggregateAndDedup(all);
-
   const itunes_used = await enrichWithItunes(unique, errors);
 
   const payload = {
@@ -308,7 +331,7 @@ async function main() {
     raw_count: all.length,
     count: unique.length,
     sources_count: sources.length,
-    itunes_used: itunes_used,
+    itunes_used,
     yt_used: 0,
     errors,
     items: unique,
